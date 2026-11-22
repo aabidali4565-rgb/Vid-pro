@@ -271,4 +271,247 @@ jobs:
                               audio.add(SonicAudioProcessor().apply { setSpeed(c.speed); setPitch(1f) })
                               video.add(SpeedChangeEffect(c.speed))
                           }
-                          video
+                          video.add(Presentation.createForHeight(1080))
+                          EditedMediaItem.Builder(item).setEffects(Effects(audio, video)).build()
+                      }
+                  }
+          
+                  val composition = Composition.Builder(EditedMediaItemSequence(edited)).build()
+                  val out = File(ctx.cacheDir, "export_${System.currentTimeMillis()}.mp4")
+          
+                  val transformer = Transformer.Builder(ctx)
+                      .setVideoMimeType(MimeTypes.VIDEO_H264)
+                      .addListener(object : Transformer.Listener {
+                          override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                              viewModelScope.launch {
+                                  val uri = withContext(Dispatchers.IO) { saveToGallery(out) }
+                                  exportState = if (uri != null) ExportState.Done(uri)
+                                  else ExportState.Error("Gallery mein save nahi hua")
+                              }
+                          }
+          
+                          override fun onError(
+                              composition: Composition,
+                              exportResult: ExportResult,
+                              exportException: ExportException
+                          ) {
+                              exportState = ExportState.Error(exportException.message ?: "Export fail")
+                          }
+                      })
+                      .build()
+                  transformer.start(composition, out.absolutePath)
+              }
+          
+              private fun saveToGallery(file: File): Uri? {
+                  val resolver = getApplication<Application>().contentResolver
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MyEditor")
+                  }
+                  val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+                  resolver.openOutputStream(uri)?.use { o -> file.inputStream().use { it.copyTo(o) } }
+                  file.delete()
+                  return uri
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/myeditor/app
+          cat > app/src/main/java/com/myeditor/app/MainActivity.kt <<'EOF_FILE'
+          @file:OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
+          
+          package com.myeditor.app
+          
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.PickVisualMediaRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.util.UnstableApi
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.ui.PlayerView
+          import coil.ImageLoader
+          import coil.compose.AsyncImage
+          import coil.decode.VideoFrameDecoder
+          
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(Modifier.fillMaxSize()) { EditorScreen() }
+                      }
+                  }
+              }
+          }
+          
+          private fun previewItem(c: Clip): MediaItem {
+              val b = MediaItem.Builder().setUri(c.uri)
+              return if (c.isImage) {
+                  b.setImageDurationMs(c.endMs - c.startMs).build()
+              } else {
+                  b.setClippingConfiguration(
+                      MediaItem.ClippingConfiguration.Builder()
+                          .setStartPositionMs(c.startMs)
+                          .setEndPositionMs(c.endMs)
+                          .build()
+                  ).build()
+              }
+          }
+          
+          @Composable
+          fun EditorScreen(vm: EditorViewModel = viewModel()) {
+              val ctx = LocalContext.current
+              val player = remember { ExoPlayer.Builder(ctx).build() }
+              DisposableEffect(Unit) { onDispose { player.release() } }
+          
+              val loader = remember {
+                  ImageLoader.Builder(ctx).components { add(VideoFrameDecoder.Factory()) }.build()
+              }
+              val picker = rememberLauncherForActivityResult(
+                  ActivityResultContracts.PickMultipleVisualMedia(30)
+              ) { uris -> vm.addMedia(uris) }
+          
+              val sel = vm.selected
+              LaunchedEffect(sel?.id, sel?.startMs, sel?.endMs, sel?.speed) {
+                  if (sel == null) {
+                      player.clearMediaItems()
+                  } else {
+                      player.setMediaItem(previewItem(sel))
+                      player.setPlaybackSpeed(sel.speed)
+                      player.prepare()
+                      player.playWhenReady = false
+                  }
+              }
+          
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .systemBarsPadding()
+                      .padding(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                  Row(
+                      Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text("My Editor", style = MaterialTheme.typography.titleLarge)
+                      Button(
+                          onClick = { vm.export() },
+                          enabled = vm.clips.isNotEmpty() && vm.exportState !is ExportState.Running
+                      ) { Text("Export") }
+                  }
+          
+                  AndroidView(
+                      factory = { c -> PlayerView(c).also { v -> v.player = player } },
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .weight(1f)
+                  )
+          
+                  when (val s = vm.exportState) {
+                      is ExportState.Running -> {
+                          Text("Export ho raha hai...")
+                          LinearProgressIndicator(Modifier.fillMaxWidth())
+                      }
+                      is ExportState.Done -> Text("Done! Gallery > Movies/MyEditor mein save ho gaya")
+                      is ExportState.Error -> Text("Error: ${s.msg}")
+                      else -> {}
+                  }
+          
+                  // Timeline
+                  LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                      item {
+                          OutlinedButton(
+                              onClick = {
+                                  picker.launch(
+                                      PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                  )
+                              },
+                              modifier = Modifier.height(72.dp)
+                          ) { Text("+ Add") }
+                      }
+                      items(vm.clips, key = { it.id }) { c ->
+                          val isSel = c.id == vm.selectedId
+                          AsyncImage(
+                              model = c.uri,
+                              imageLoader = loader,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier
+                                  .size(width = 72.dp, height = 72.dp)
+                                  .clip(RoundedCornerShape(8.dp))
+                                  .border(
+                                      if (isSel) 3.dp else 0.dp,
+                                      MaterialTheme.colorScheme.primary,
+                                      RoundedCornerShape(8.dp)
+                                  )
+                                  .clickable { vm.select(c.id) }
+                          )
+                      }
+                  }
+          
+                  // Controls
+                  if (sel != null) {
+                      var range by remember(sel.id, sel.startMs, sel.endMs) {
+                          mutableStateOf(sel.startMs.toFloat()..sel.endMs.toFloat())
+                      }
+                      Text(
+                          "Trim: ${range.start.toLong() / 1000.0}s - ${range.endInclusive.toLong() / 1000.0}s",
+                          style = MaterialTheme.typography.bodySmall
+                      )
+                      RangeSlider(
+                          value = range,
+                          onValueChange = { range = it },
+                          valueRange = 0f..sel.durationMs.toFloat(),
+                          onValueChangeFinished = {
+                              vm.trim(sel.id, range.start.toLong(), range.endInclusive.toLong())
+                          }
+                      )
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(onClick = { vm.split(player.currentPosition) }) { Text("Split") }
+                          Button(
+                              onClick = { vm.delete(sel.id) },
+                              colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                          ) { Text("Delete") }
+                      }
+                      if (!sel.isImage) {
+                          LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              items(listOf(0.5f, 1f, 1.5f, 2f, 3f)) { sp ->
+                                  FilterChip(
+                                      selected = sel.speed == sp,
+                                      onClick = { vm.setSpeed(sel.id, sp) },
+                                      label = { Text("${sp}x") }
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyEditor-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
