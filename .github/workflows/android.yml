@@ -1,5 +1,3 @@
-
-======== FILE: .github/workflows/build.yml ========
 name: Build APK
 on:
   push:
@@ -16,507 +14,261 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7
-      - run: gradle assembleDebug --stacktrace
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MyEditor-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-
-======== FILE: .gitignore ========
-*.iml
-.gradle
-/local.properties
-/.idea
-build/
-/captures
-.DS_Store
-
-======== FILE: README.md ========
-# My Editor (Step 1)
-Import video/images, trim, split, speed, delete, export (1080p).
-Push to GitHub -> Actions tab -> Build APK -> download artifact.
-
-======== FILE: app/build.gradle.kts ========
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
-
-android {
-    namespace = "com.myeditor.app"
-    compileSdk = 34
-
-    defaultConfig {
-        applicationId = "com.myeditor.app"
-        minSdk = 29
-        targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
-    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
-}
-
-dependencies {
-    val media3 = "1.4.1"
-    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.activity:activity-compose:1.9.0")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3")
-
-    implementation("androidx.media3:media3-exoplayer:$media3")
-    implementation("androidx.media3:media3-ui:$media3")
-    implementation("androidx.media3:media3-transformer:$media3")
-    implementation("androidx.media3:media3-effect:$media3")
-    implementation("androidx.media3:media3-common:$media3")
-
-    implementation("io.coil-kt:coil-compose:2.6.0")
-    implementation("io.coil-kt:coil-video:2.6.0")
-}
-
-======== FILE: app/src/main/AndroidManifest.xml ========
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <application
-        android:label="My Editor"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-
-======== FILE: app/src/main/java/com/myeditor/app/EditorViewModel.kt ========
-@file:OptIn(UnstableApi::class)
-
-package com.myeditor.app
-
-import android.app.Application
-import android.content.ContentValues
-import android.media.MediaMetadataRetriever
-import android.net.Uri
-import android.provider.MediaStore
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
-import androidx.media3.common.Effect
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.common.audio.SonicAudioProcessor
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.effect.Presentation
-import androidx.media3.effect.SpeedChangeEffect
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.Effects
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.Transformer
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
-
-class EditorViewModel(app: Application) : AndroidViewModel(app) {
-
-    var clips by mutableStateOf(listOf<Clip>())
-        private set
-    var selectedId by mutableStateOf<Long?>(null)
-        private set
-    var exportState by mutableStateOf<ExportState>(ExportState.Idle)
-        private set
-
-    private var nextId = 1L
-
-    val selected: Clip? get() = clips.firstOrNull { it.id == selectedId }
-
-    fun select(id: Long) { selectedId = id }
-
-    fun addMedia(uris: List<Uri>) {
-        val ctx = getApplication<Application>()
-        viewModelScope.launch {
-            for (uri in uris) {
-                val type = ctx.contentResolver.getType(uri) ?: ""
-                val isImage = type.startsWith("image")
-                val dur = if (isImage) 10_000L else withContext(Dispatchers.IO) { videoDuration(uri) }
-                val end = if (isImage) 3_000L else dur
-                val clip = Clip(nextId++, uri, isImage, 0L, end, dur.coerceAtLeast(1000L))
-                clips = clips + clip
-                if (selectedId == null) selectedId = clip.id
-            }
-        }
-    }
-
-    private fun videoDuration(uri: Uri): Long {
-        val r = MediaMetadataRetriever()
-        return try {
-            r.setDataSource(getApplication<Application>(), uri)
-            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-        } catch (e: Exception) {
-            0L
-        } finally {
-            r.release()
-        }
-    }
-
-    fun delete(id: Long) {
-        clips = clips.filter { it.id != id }
-        if (selectedId == id) selectedId = clips.firstOrNull()?.id
-    }
-
-    fun trim(id: Long, start: Long, end: Long) {
-        if (end - start < 200) return
-        clips = clips.map { if (it.id == id) it.copy(startMs = start, endMs = end) else it }
-    }
-
-    fun setSpeed(id: Long, speed: Float) {
-        clips = clips.map { if (it.id == id) it.copy(speed = speed) else it }
-    }
-
-    /** posMs = playhead position inside the selected clip's preview */
-    fun split(posMs: Long) {
-        val c = selected ?: return
-        val cut = c.startMs + posMs
-        if (cut - c.startMs < 300 || c.endMs - cut < 300) return
-        val a = c.copy(endMs = cut)
-        val b = c.copy(id = nextId++, startMs = cut)
-        clips = clips.flatMap { if (it.id == c.id) listOf(a, b) else listOf(it) }
-        selectedId = a.id
-    }
-
-    fun export() {
-        val list = clips
-        if (list.isEmpty()) return
-        val ctx = getApplication<Application>()
-        exportState = ExportState.Running
-
-        val edited = list.map { c ->
-            if (c.isImage) {
-                val d = c.endMs - c.startMs
-                val item = MediaItem.Builder().setUri(c.uri).setImageDurationMs(d).build()
-                EditedMediaItem.Builder(item)
-                    .setDurationUs(d * 1000)
-                    .setFrameRate(30)
-                    .setEffects(Effects(emptyList(), listOf<Effect>(Presentation.createForHeight(1080))))
-                    .build()
-            } else {
-                val clipping = MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(c.startMs)
-                    .setEndPositionMs(c.endMs)
-                    .build()
-                val item = MediaItem.Builder().setUri(c.uri).setClippingConfiguration(clipping).build()
-                val audio = mutableListOf<AudioProcessor>()
-                val video = mutableListOf<Effect>()
-                if (c.speed != 1f) {
-                    audio.add(SonicAudioProcessor().apply { setSpeed(c.speed); setPitch(1f) })
-                    video.add(SpeedChangeEffect(c.speed))
-                }
-                video.add(Presentation.createForHeight(1080))
-                EditedMediaItem.Builder(item).setEffects(Effects(audio, video)).build()
-            }
-        }
-
-        val composition = Composition.Builder(EditedMediaItemSequence(edited)).build()
-        val out = File(ctx.cacheDir, "export_${System.currentTimeMillis()}.mp4")
-
-        val transformer = Transformer.Builder(ctx)
-            .setVideoMimeType(MimeTypes.VIDEO_H264)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    viewModelScope.launch {
-                        val uri = withContext(Dispatchers.IO) { saveToGallery(out) }
-                        exportState = if (uri != null) ExportState.Done(uri)
-                        else ExportState.Error("Gallery mein save nahi hua")
-                    }
-                }
-
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    exportState = ExportState.Error(exportException.message ?: "Export fail")
-                }
-            })
-            .build()
-        transformer.start(composition, out.absolutePath)
-    }
-
-    private fun saveToGallery(file: File): Uri? {
-        val resolver = getApplication<Application>().contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MyEditor")
-        }
-        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
-        resolver.openOutputStream(uri)?.use { o -> file.inputStream().use { it.copyTo(o) } }
-        file.delete()
-        return uri
-    }
-}
-
-======== FILE: app/src/main/java/com/myeditor/app/MainActivity.kt ========
-@file:OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
-
-package com.myeditor.app
-
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.media3.common.MediaItem
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
-import coil.ImageLoader
-import coil.compose.AsyncImage
-import coil.decode.VideoFrameDecoder
-
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(Modifier.fillMaxSize()) { EditorScreen() }
-            }
-        }
-    }
-}
-
-private fun previewItem(c: Clip): MediaItem {
-    val b = MediaItem.Builder().setUri(c.uri)
-    return if (c.isImage) {
-        b.setImageDurationMs(c.endMs - c.startMs).build()
-    } else {
-        b.setClippingConfiguration(
-            MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionMs(c.startMs)
-                .setEndPositionMs(c.endMs)
-                .build()
-        ).build()
-    }
-}
-
-@Composable
-fun EditorScreen(vm: EditorViewModel = viewModel()) {
-    val ctx = LocalContext.current
-    val player = remember { ExoPlayer.Builder(ctx).build() }
-    DisposableEffect(Unit) { onDispose { player.release() } }
-
-    val loader = remember {
-        ImageLoader.Builder(ctx).components { add(VideoFrameDecoder.Factory()) }.build()
-    }
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(30)
-    ) { uris -> vm.addMedia(uris) }
-
-    val sel = vm.selected
-    LaunchedEffect(sel?.id, sel?.startMs, sel?.endMs, sel?.speed) {
-        if (sel == null) {
-            player.clearMediaItems()
-        } else {
-            player.setMediaItem(previewItem(sel))
-            player.setPlaybackSpeed(sel.speed)
-            player.prepare()
-            player.playWhenReady = false
-        }
-    }
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .systemBarsPadding()
-            .padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("My Editor", style = MaterialTheme.typography.titleLarge)
-            Button(
-                onClick = { vm.export() },
-                enabled = vm.clips.isNotEmpty() && vm.exportState !is ExportState.Running
-            ) { Text("Export") }
-        }
-
-        AndroidView(
-            factory = { c -> PlayerView(c).also { v -> v.player = player } },
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-        )
-
-        when (val s = vm.exportState) {
-            is ExportState.Running -> {
-                Text("Export ho raha hai...")
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-            }
-            is ExportState.Done -> Text("Done! Gallery > Movies/MyEditor mein save ho gaya")
-            is ExportState.Error -> Text("Error: ${s.msg}")
-            else -> {}
-        }
-
-        // Timeline
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            item {
-                OutlinedButton(
-                    onClick = {
-                        picker.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                        )
-                    },
-                    modifier = Modifier.height(72.dp)
-                ) { Text("+ Add") }
-            }
-            items(vm.clips, key = { it.id }) { c ->
-                val isSel = c.id == vm.selectedId
-                AsyncImage(
-                    model = c.uri,
-                    imageLoader = loader,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(width = 72.dp, height = 72.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .border(
-                            if (isSel) 3.dp else 0.dp,
-                            MaterialTheme.colorScheme.primary,
-                            RoundedCornerShape(8.dp)
-                        )
-                        .clickable { vm.select(c.id) }
-                )
-            }
-        }
-
-        // Controls
-        if (sel != null) {
-            var range by remember(sel.id, sel.startMs, sel.endMs) {
-                mutableStateOf(sel.startMs.toFloat()..sel.endMs.toFloat())
-            }
-            Text(
-                "Trim: ${range.start.toLong() / 1000.0}s - ${range.endInclusive.toLong() / 1000.0}s",
-                style = MaterialTheme.typography.bodySmall
-            )
-            RangeSlider(
-                value = range,
-                onValueChange = { range = it },
-                valueRange = 0f..sel.durationMs.toFloat(),
-                onValueChangeFinished = {
-                    vm.trim(sel.id, range.start.toLong(), range.endInclusive.toLong())
-                }
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { vm.split(player.currentPosition) }) { Text("Split") }
-                Button(
-                    onClick = { vm.delete(sel.id) },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                ) { Text("Delete") }
-            }
-            if (!sel.isImage) {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(listOf(0.5f, 1f, 1.5f, 2f, 3f)) { sp ->
-                        FilterChip(
-                            selected = sel.speed == sp,
-                            onClick = { vm.setSpeed(sel.id, sp) },
-                            label = { Text("${sp}x") }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-======== FILE: app/src/main/java/com/myeditor/app/Models.kt ========
-package com.myeditor.app
-
-import android.net.Uri
-
-data class Clip(
-    val id: Long,
-    val uri: Uri,
-    val isImage: Boolean,
-    val startMs: Long,
-    val endMs: Long,
-    val durationMs: Long,
-    val speed: Float = 1f
-)
-
-sealed interface ExportState {
-    object Idle : ExportState
-    object Running : ExportState
-    data class Done(val uri: Uri) : ExportState
-    data class Error(val msg: String) : ExportState
-}
-
-======== FILE: build.gradle.kts ========
-plugins {
-    id("com.android.application") version "8.5.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-}
-
-======== FILE: gradle.properties ========
-org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
-android.useAndroidX=true
-kotlin.code.style=official
-
-======== FILE: settings.gradle.kts ========
-pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-rootProject.name = "MyEditor"
-include(":app")
+      - name: Create project files
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MyEditor"
+          include(":app")
+          EOF_FILE
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p .
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.myeditor.app"
+              compileSdk = 34
+          
+              defaultConfig {
+                  applicationId = "com.myeditor.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+          
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          
+          dependencies {
+              val media3 = "1.4.1"
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3")
+          
+              implementation("androidx.media3:media3-exoplayer:$media3")
+              implementation("androidx.media3:media3-ui:$media3")
+              implementation("androidx.media3:media3-transformer:$media3")
+              implementation("androidx.media3:media3-effect:$media3")
+              implementation("androidx.media3:media3-common:$media3")
+          
+              implementation("io.coil-kt:coil-compose:2.6.0")
+              implementation("io.coil-kt:coil-video:2.6.0")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <application
+                  android:label="My Editor"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/myeditor/app
+          cat > app/src/main/java/com/myeditor/app/Models.kt <<'EOF_FILE'
+          package com.myeditor.app
+          
+          import android.net.Uri
+          
+          data class Clip(
+              val id: Long,
+              val uri: Uri,
+              val isImage: Boolean,
+              val startMs: Long,
+              val endMs: Long,
+              val durationMs: Long,
+              val speed: Float = 1f
+          )
+          
+          sealed interface ExportState {
+              object Idle : ExportState
+              object Running : ExportState
+              data class Done(val uri: Uri) : ExportState
+              data class Error(val msg: String) : ExportState
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/myeditor/app
+          cat > app/src/main/java/com/myeditor/app/EditorViewModel.kt <<'EOF_FILE'
+          @file:OptIn(UnstableApi::class)
+          
+          package com.myeditor.app
+          
+          import android.app.Application
+          import android.content.ContentValues
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.provider.MediaStore
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import androidx.media3.common.Effect
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MimeTypes
+          import androidx.media3.common.audio.AudioProcessor
+          import androidx.media3.common.audio.SonicAudioProcessor
+          import androidx.media3.common.util.UnstableApi
+          import androidx.media3.effect.Presentation
+          import androidx.media3.effect.SpeedChangeEffect
+          import androidx.media3.transformer.Composition
+          import androidx.media3.transformer.EditedMediaItem
+          import androidx.media3.transformer.EditedMediaItemSequence
+          import androidx.media3.transformer.Effects
+          import androidx.media3.transformer.ExportException
+          import androidx.media3.transformer.ExportResult
+          import androidx.media3.transformer.Transformer
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          
+          class EditorViewModel(app: Application) : AndroidViewModel(app) {
+          
+              var clips by mutableStateOf(listOf<Clip>())
+                  private set
+              var selectedId by mutableStateOf<Long?>(null)
+                  private set
+              var exportState by mutableStateOf<ExportState>(ExportState.Idle)
+                  private set
+          
+              private var nextId = 1L
+          
+              val selected: Clip? get() = clips.firstOrNull { it.id == selectedId }
+          
+              fun select(id: Long) { selectedId = id }
+          
+              fun addMedia(uris: List<Uri>) {
+                  val ctx = getApplication<Application>()
+                  viewModelScope.launch {
+                      for (uri in uris) {
+                          val type = ctx.contentResolver.getType(uri) ?: ""
+                          val isImage = type.startsWith("image")
+                          val dur = if (isImage) 10_000L else withContext(Dispatchers.IO) { videoDuration(uri) }
+                          val end = if (isImage) 3_000L else dur
+                          val clip = Clip(nextId++, uri, isImage, 0L, end, dur.coerceAtLeast(1000L))
+                          clips = clips + clip
+                          if (selectedId == null) selectedId = clip.id
+                      }
+                  }
+              }
+          
+              private fun videoDuration(uri: Uri): Long {
+                  val r = MediaMetadataRetriever()
+                  return try {
+                      r.setDataSource(getApplication<Application>(), uri)
+                      r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                  } catch (e: Exception) {
+                      0L
+                  } finally {
+                      r.release()
+                  }
+              }
+          
+              fun delete(id: Long) {
+                  clips = clips.filter { it.id != id }
+                  if (selectedId == id) selectedId = clips.firstOrNull()?.id
+              }
+          
+              fun trim(id: Long, start: Long, end: Long) {
+                  if (end - start < 200) return
+                  clips = clips.map { if (it.id == id) it.copy(startMs = start, endMs = end) else it }
+              }
+          
+              fun setSpeed(id: Long, speed: Float) {
+                  clips = clips.map { if (it.id == id) it.copy(speed = speed) else it }
+              }
+          
+              /** posMs = playhead position inside the selected clip's preview */
+              fun split(posMs: Long) {
+                  val c = selected ?: return
+                  val cut = c.startMs + posMs
+                  if (cut - c.startMs < 300 || c.endMs - cut < 300) return
+                  val a = c.copy(endMs = cut)
+                  val b = c.copy(id = nextId++, startMs = cut)
+                  clips = clips.flatMap { if (it.id == c.id) listOf(a, b) else listOf(it) }
+                  selectedId = a.id
+              }
+          
+              fun export() {
+                  val list = clips
+                  if (list.isEmpty()) return
+                  val ctx = getApplication<Application>()
+                  exportState = ExportState.Running
+          
+                  val edited = list.map { c ->
+                      if (c.isImage) {
+                          val d = c.endMs - c.startMs
+                          val item = MediaItem.Builder().setUri(c.uri).setImageDurationMs(d).build()
+                          EditedMediaItem.Builder(item)
+                              .setDurationUs(d * 1000)
+                              .setFrameRate(30)
+                              .setEffects(Effects(emptyList(), listOf<Effect>(Presentation.createForHeight(1080))))
+                              .build()
+                      } else {
+                          val clipping = MediaItem.ClippingConfiguration.Builder()
+                              .setStartPositionMs(c.startMs)
+                              .setEndPositionMs(c.endMs)
+                              .build()
+                          val item = MediaItem.Builder().setUri(c.uri).setClippingConfiguration(clipping).build()
+                          val audio = mutableListOf<AudioProcessor>()
+                          val video = mutableListOf<Effect>()
+                          if (c.speed != 1f) {
+                              audio.add(SonicAudioProcessor().apply { setSpeed(c.speed); setPitch(1f) })
+                              video.add(SpeedChangeEffect(c.speed))
+                          }
+                          video
